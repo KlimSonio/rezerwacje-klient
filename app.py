@@ -1,185 +1,218 @@
 import streamlit as st
-from sqlalchemy import create_engine, text
-import pandas as pd
 from datetime import datetime, date, timedelta
+import pandas as pd
+from sqlalchemy import create_engine, text
 
-# --- 1. KONFIGURACJA STRONY ---
-st.set_page_config(
-    page_title="B1 Studio - Rezerwacje", 
-    layout="centered"
-)
+# --- 1. KONFIGURACJA STRONY I STYLE CSS (STYL BOOKSY + INTER) ---
+st.set_page_config(page_title="Rezerwacja Studia", page_icon="🎙️", layout="centered")
 
 st.markdown("""
     <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
+
+    html, body, [data-testid="stWidgetLabel"], .main, button, input, select, textarea {
+        font-family: 'Inter', sans-serif !important;
+    }
+
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
     div[data-testid="stDecoration"] {display: none;}
+    
+    h1, h2, h3 {
+        font-family: 'Inter', sans-serif !important;
+        font-weight: 700 !important;
+        color: #111827;
+        letter-spacing: -0.02em;
+    }
+
+    .main-title {
+        margin-top: -40px;
+        text-align: center;
+        padding-bottom: 5px;
+    }
+
+    /* Box braku miejsc - ciepły i pomocny */
+    .no-slots-box {
+        background-color: #fff7ed;
+        border: 1px solid #ffedd5;
+        border-left: 5px solid #f97316;
+        padding: 20px;
+        border-radius: 12px;
+        color: #9a3412;
+        font-size: 0.9rem;
+        margin-top: 10px;
+    }
+
+    .status-pending {
+        background-color: #f0fdf4;
+        border: 1px solid #dcfce7;
+        color: #166534;
+        padding: 15px;
+        border-radius: 8px;
+        font-size: 0.9rem;
+        margin-top: 15px;
+        border-left: 5px solid #22c55e;
+    }
+    
+    .weekend-info-box {
+        background-color: #f0f9ff;
+        border: 1px solid #e0f2fe;
+        border-left: 5px solid #0ea5e9;
+        padding: 15px;
+        border-radius: 8px;
+        color: #0c4a6e;
+        font-size: 0.85rem;
+        margin-top: 10px;
+    }
+
+    .contact-box {
+        background-color: #f9fafb;
+        border: 1px solid #f3f4f6;
+        padding: 20px;
+        border-radius: 12px;
+        text-align: center;
+        border-left: 5px solid #9ca3af;
+    }
+
+    .call-button {
+        background-color: #374151;
+        color: #ffffff !important;
+        padding: 12px 24px;
+        border-radius: 8px;
+        text-decoration: none;
+        display: inline-block;
+        font-weight: 600;
+        margin-top: 10px;
+    }
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. POŁĄCZENIE Z BAZĄ DANYCH ---
-try:
-    db_url = st.secrets["connections"]["supabase_db"]["url"]
-    engine = create_engine(db_url)
-except KeyError:
-    st.error("❌ Błąd: Brak konfiguracji bazy danych w secrets.toml!")
-    st.stop()
+st.markdown('<h1 class="main-title">Rezerwacja sesji nagraniowej</h1>', unsafe_allow_html=True)
 
-# --- 3. LOGIKA BIZNESOWA ---
-def generuj_siatke_godzin(start_str, koniec_str):
-    godziny = []
-    start = datetime.strptime(start_str, "%H:%M")
-    koniec = datetime.strptime("23:30" if koniec_str in ["24:00", "23:59"] else koniec_str, "%H:%M")
-    curr = start
-    while curr <= koniec:
-        godziny.append(curr.strftime("%H:%M"))
-        curr += timedelta(minutes=30)
-    return godziny
+# --- 3. POŁĄCZENIE Z BAZĄ ---
+db_url = st.secrets["connections"]["supabase_db"]["url"]
+engine = create_engine(db_url)
 
-def pobierz_rezerwacje_realizatora(wybrana_data, realizator):
+# --- 4. FUNKCJE LOGICZNE ---
+def pobierz_zajete_terminy(wybrana_data, realizator_id):
     data_str = wybrana_data.strftime("%Y-%m-%d")
     query = """
-        SELECT godzina, godzina_konca FROM rezerwacje 
-        WHERE data = :data AND (realizator = :realizator OR imie_nazwisko = '🔒 BLOKADA TERMINU')
+        SELECT godzina, godzina_konca 
+        FROM rezerwacje 
+        WHERE data = :data 
+        AND (realizator = :realizator OR imie_nazwisko = '🔒 BLOKADA TERMINU')
+        AND status != 'odrzucona'
     """
-    try:
-        return pd.read_sql_query(text(query), con=engine, params={"data": data_str, "realizator": realizator})
-    except Exception:
-        return pd.DataFrame()
+    return pd.read_sql_query(text(query), con=engine, params={"data": data_str, "realizator": realizator_id})
 
-def czy_termin_zajety(start_str, koniec_str, df_zajete):
-    if df_zajete.empty: return False
+def czy_slot_wolny(start_str, koniec_str, df_zajete):
     t_start = datetime.strptime(start_str, "%H:%M").time()
-    t_koniec_val = "23:59" if koniec_str in ["24:00", "23:59"] else koniec_str
-    t_koniec = datetime.strptime(t_koniec_val, "%H:%M").time()
-    
+    t_koniec = datetime.strptime("23:59" if koniec_str in ["00:00", "24:00"] else koniec_str, "%H:%M").time()
     for _, row in df_zajete.iterrows():
         z_start = datetime.strptime(row['godzina'], "%H:%M").time()
-        z_koniec_val = "23:59" if row['godzina_konca'] in ["24:00", "23:59"] else row['godzina_konca']
-        z_koniec = datetime.strptime(z_koniec_val, "%H:%M").time()
+        z_koniec_raw = row['godzina_konca']
+        z_koniec = datetime.strptime("23:59" if z_koniec_raw in ["00:00", "24:00"] else z_koniec_raw, "%H:%M").time()
         if t_start < z_koniec and t_koniec > z_start:
-            return True
-    return False
+            return False
+    return True
 
-def zapisz_rezerwacje(data_str, g_start, g_koniec, realizator, imie, email, telefon, uwagi):
-    query = """
-        INSERT INTO rezerwacje (data, godzina, godzina_konca, realizator, imie_nazwisko, email, telefon, uwagi)
-        VALUES (:data, :godzina, :godzina_konca, :realizator, :imie, :email, :telefon, :uwagi)
-    """
-    with engine.begin() as connection:
-        connection.execute(text(query), {
-            "data": data_str, "godzina": g_start, "godzina_konca": g_koniec,
-            "realizator": realizator, "imie": imie, "email": email, "telefon": telefon, "uwagi": uwagi
-        })
-
-# --- 4. INTERFEJS UŻYTKOWNIKA ---
-st.header("🎙️ Rezerwacja Sesji w B1 Studio")
-
-col1, col2 = st.columns([1, 1], gap="large")
+# --- 5. INTERFEJS ---
+col1, col2 = st.columns([1, 1])
 
 with col1:
-    st.subheader("1. Termin sesji")
-    realizator = st.selectbox("Wybierz realizatora dźwięku:", ["Maciek", "Tomek"])
+    st.subheader("1. Termin")
+    wybrana_data = st.date_input("Data:", min_value=date.today())
+    czy_weekend = wybrana_data.weekday() >= 5
     
-    g_start_p, g_koniec_p = ("08:00", "16:00") if realizator == "Maciek" else ("16:00", "23:59")
-    st.caption(f"{'🌅' if realizator == 'Maciek' else '🌃'} Dyżur: {g_start_p} - {g_koniec_p.replace('23:59', '00:00')}")
-        
-    dlugosc = st.selectbox("Długość sesji:", ["1 godzina", "2 godziny", "3 godziny"])
-    godziny_int = int(dlugosc.split()[0])
-    wybrana_data = st.date_input("Data sesji:", min_value=date.today())
-
-    wszystkie = generuj_siatke_godzin(g_start_p, g_koniec_p)
-    df_zajete = pobierz_rezerwacje_realizatora(wybrana_data, realizator)
+    opcje = ["Maciek", "Tomek"]
+    if czy_weekend:
+        opcje = ["Tomek"]
+        st.markdown('<div class="weekend-info-box"><b>Weekend:</b> Sesje z Tomkiem (12:00 – 22:00).</div>', unsafe_allow_html=True)
     
-    wolne_starty = []
-    for g in wszystkie:
-        dt_s = datetime.strptime(g, "%H:%M")
-        dt_k = dt_s + timedelta(hours=godziny_int)
-        
-        if realizator == "Tomek" and dt_k > datetime.strptime("23:59", "%H:%M") + timedelta(minutes=1): continue
-        if realizator == "Maciek" and dt_k > datetime.strptime("16:00", "%H:%M"): continue
-            
-        dt_k_buf = dt_k + timedelta(minutes=30)
-        g_k_buf_str = "23:59" if dt_k_buf >= datetime.strptime("23:59", "%H:%M") else dt_k_buf.strftime("%H:%M")
-        
-        if not czy_termin_zajety(g, g_k_buf_str, df_zajete):
-            wolne_starty.append(g)
-
-    brakuje_terminow = len(wolne_starty) == 0
-
-    if not brakuje_terminow:
-        wybrana_g_start = st.selectbox("Dostępne godziny startu:", wolne_starty)
-        dt_k_final = datetime.strptime(wybrana_g_start, "%H:%M") + timedelta(hours=godziny_int)
-        st.success(f"✅ Wybrano: {wybrana_g_start} - {dt_k_final.strftime('%H:%M')}")
+    wybor = st.radio("Realizator:", opcje, horizontal=True, label_visibility="collapsed")
+    
+    if wybor == "Maciek":
+        realizator_id, h_start, h_end = "Maciek", 8, 15
+        st.caption("Dostępność: 08:00 – 15:00")
     else:
-        st.error("❌ Brak wolnych terminów.")
-        wybrana_g_start = None
+        if czy_weekend:
+            realizator_id, h_start, h_end = "Tomek", 12, 22
+            st.caption("Dostępność: 12:00 – 22:00")
+        else:
+            realizator_id, h_start, h_end = "Tomek", 15, 23
+            st.caption("Dostępność: 15:00 – 00:00")
+
+    dlugosc = st.selectbox("Długość sesji:", ["1 godzina", "2 godziny", "3 godziny", "Więcej (kontakt)"])
+    
+    godzina_start = None
+    if "Więcej" not in dlugosc:
+        ile_h = int(dlugosc.split()[0])
+        df_zajete = pobierz_zajete_terminy(wybrana_data, realizator_id)
+        wolne_godziny = []
+        teraz = datetime.now()
+        current_time = datetime.strptime(f"{h_start}:00", "%H:%M")
+        
+        while True:
+            end_session = current_time + timedelta(hours=ile_h)
+            limit = datetime.strptime(f"{h_end}:00", "%H:%M") if not (realizator_id == "Tomek" and not czy_weekend) else datetime.strptime("23:59", "%H:%M")
+            if end_session > limit and not (realizator_id == "Tomek" and end_session.hour == 0): break
+
+            slot_start_str = current_time.strftime("%H:%M")
+            if czy_slot_wolny(slot_start_str, end_session.strftime("%H:%M"), df_zajete):
+                if not (wybrana_data == date.today() and datetime.combine(date.today(), current_time.time()) < teraz + timedelta(minutes=30)):
+                    wolne_godziny.append(slot_start_str)
+            current_time += timedelta(minutes=30)
+            if current_time.hour == 0 and current_time.minute == 0: break
+
+        if wolne_godziny:
+            godzina_start = st.selectbox("Godzina startu:", wolne_godziny)
+        else:
+            st.markdown(f"""
+                <div class="no-slots-box">
+                    <p style="margin: 0; font-size: 1.05rem;">☕ <b>{wybor} nie ma już wolnych miejsc.</b></p>
+                    <p style="margin: 5px 0 0 0; opacity: 0.85; font-size: 0.85rem;">
+                        Wybierz inną datę lub napisz do nas na Instagramie – spróbujemy coś wymyślić!
+                    </p>
+                </div>
+            """, unsafe_allow_html=True)
 
 with col2:
     st.subheader("2. Twoje dane")
-    if "sukces" not in st.session_state: st.session_state.sukces = False
-
-    if st.session_state.sukces:
-        st.success("🎉 Rezerwacja przyjęta!")
-        if st.button("Zarezerwuj kolejną sesję"):
-            st.session_state.sukces = False
-            st.rerun()
+    if "Więcej" in dlugosc:
+        st.markdown('<div class="contact-box"><p>Dłuższe sesje ustalamy telefonicznie.</p><a href="tel:+48000000000" class="call-button">Zadzwoń</a></div>', unsafe_allow_html=True)
     else:
-        with st.form("form_rez", clear_on_submit=True):
-            imie = st.text_input("Imię i Nazwisko / Projekt *")
-            email = st.text_input("E-mail *")
+        with st.form("booking_form", clear_on_submit=True):
+            klient = st.text_input("Imię i Nazwisko / Projekt *")
+            mail = st.text_input("E-mail *")
             telefon = st.text_input("Numer telefonu *")
-            uwagi = st.text_area("Uwagi (opcjonalnie)")
+            opis = st.text_area("Uwagi")
+            submit = st.form_submit_button("REZERWUJĘ", use_container_width=True, disabled=not godzina_start)
             
-            submit = st.form_submit_button(
-                "Potwierdzam Rezerwację", 
-                use_container_width=True, 
-                disabled=brakuje_terminow
-            )
-
             if submit:
-                if not imie or not email or not telefon:
-                    st.error("Uzupełnij wszystkie pola z gwiazdką (*)")
-                elif wybrana_g_start:
-                    df_final = pobierz_rezerwacje_realizatora(wybrana_data, realizator)
-                    dt_k_buf = datetime.strptime(wybrana_g_start, "%H:%M") + timedelta(hours=godziny_int, minutes=30)
-                    g_k_buf_str = "23:59" if dt_k_buf >= datetime.strptime("23:59", "%H:%M") else dt_k_buf.strftime("%H:%M")
-                    
-                    if czy_termin_zajety(wybrana_g_start, g_k_buf_str, df_final):
-                        st.error("Termin zajęty!")
-                    else:
-                        zapisz_rezerwacje(wybrana_data.strftime("%Y-%m-%d"), wybrana_g_start, g_k_buf_str, realizator, imie, email, telefon, uwagi)
-                        st.session_state.sukces = True
-                        st.rerun()
+                if klient and mail and telefon:
+                    try:
+                        dt_k = datetime.strptime(godzina_start, "%H:%M") + timedelta(hours=ile_h)
+                        g_koniec = dt_k.strftime("%H:%M") if not (dt_k.hour == 0 and dt_k.minute == 0) else "23:59"
+                        with engine.begin() as conn:
+                            conn.execute(text("INSERT INTO rezerwacje (data, godzina, godzina_konca, realizator, imie_nazwisko, email, telefon, uwagi, status) VALUES (:d, :gs, :gk, :r, :n, :e, :t, :u, 'oczekuje')"),
+                            {"d": wybrana_data, "gs": godzina_start, "gk": g_koniec, "r": realizator_id, "n": klient, "e": mail, "t": telefon, "u": opis})
+                        st.markdown(f"""
+                            <div class="status-pending">
+                                <b>Wysłano!</b> Rezerwacja na {wybrana_data} o {godzina_start} czeka na potwierdzenie. Odezwiemy się wkrótce! ⏳
+                            </div>
+                        """, unsafe_allow_html=True)
+                        st.balloons()
+                    except Exception as e: st.error("Błąd zapisu.")
+                else: st.warning("Uzupełnij pola z *")
 
-# --- 5. STOPKA I KONTAKT ---
-st.write("") # Odstęp dla lepszego wyglądu na mobilkach
-st.divider() 
-
-col_f1, col_f2 = st.columns(2)
-
-with col_f1:
-    st.markdown("### 📞 Kontakt bezpośredni")
-    st.markdown(f"""
-    **Maciek:** [+48 509 344 434](tel:+48509344434)  
-    **Tomek:** [+48 798 513 689](tel:+48798513689)
-    """)
-
-with col_f2:
-    # 1. Kodujemy plik do formatu tekstowego (Base64)
-    import base64
-    with open("b1studio_logo_pion.png", "rb") as f:
-        data = f.read()
-        img_base64 = base64.b64encode(data).decode()
-
-    # 2. Wyświetlamy logo i napis w jednej linii
-    st.markdown(f"""
-        <h3 style="margin-top: 0;">
-            <img src="data:image/png;base64,{img_base64}" width="100" style="vertical-align: middle; margin-right: 10px;">
-           
-        </h3>
-    """, unsafe_allow_html=True)
-    
-    st.markdown("System rezerwacji online dla klientów b1 Studio.")
-    st.caption("© 2026 b1 Studio. Wszystkie prawa zastrzeżone.")
+# --- 6. STOPKA ---
+st.markdown("---")
+social_html = """
+<div style="display: flex; justify-content: center; gap: 35px; margin-top: 10px; margin-bottom: 25px;">
+    <a href="#" style="color: #E4405F;"><svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="5" ry="5"></rect><path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"></path><line x1="17.5" y1="6.5" x2="17.51" y2="6.5"></line></svg></a>
+    <a href="#" style="color: #1877F2;"><svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"></path></svg></a>
+    <a href="#" style="color: #34D399;"><svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg></a>
+</div>
+"""
+st.markdown(social_html, unsafe_allow_html=True)
